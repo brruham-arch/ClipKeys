@@ -5,8 +5,6 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
-import android.os.Handler
-import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.TypedValue
@@ -16,36 +14,24 @@ import android.widget.*
 
 class ClipKeysIME : InputMethodService() {
 
-    // State
     private var isShifted = false
     private var isCapsLock = false
     private var isNumberMode = false
     private var isClipboardMode = false
     private var currentWord = StringBuilder()
+    private var prevWord = ""
 
-    // Views
     private lateinit var rootView: LinearLayout
-    private lateinit var predictionBar: LinearLayout
+    private lateinit var suggestionBar: LinearLayout
     private lateinit var keyboardContainer: FrameLayout
-    private lateinit var pred1: TextView
-    private lateinit var pred2: TextView
-    private lateinit var pred3: TextView
-
-    // Clipboard panel views
     private lateinit var clipSearchEdit: EditText
     private lateinit var clipList: ListView
-    private var clipAdapter: ClipboardListAdapter? = null
 
-    // Clipboard monitoring
     private var clipboardManager: ClipboardManager? = null
     private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
         val text = clipboardManager?.primaryClip?.getItemAt(0)?.text?.toString() ?: return@OnPrimaryClipChangedListener
-        if (text.isNotBlank()) {
-            ClipboardStore.add(this, text)
-        }
+        if (text.isNotBlank()) ClipboardStore.add(this, text)
     }
-
-    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate() {
         super.onCreate()
@@ -57,7 +43,7 @@ class ClipKeysIME : InputMethodService() {
 
     override fun onDestroy() {
         clipboardManager?.removePrimaryClipChangedListener(clipListener)
-        WordPredictor.saveLearnedWords(this)
+        WordPredictor.save(this)
         super.onDestroy()
     }
 
@@ -66,22 +52,19 @@ class ClipKeysIME : InputMethodService() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#1A1A1A"))
         }
-
-        predictionBar = buildPredictionBar()
-        rootView.addView(predictionBar)
-
+        suggestionBar = buildSuggestionBar()
+        rootView.addView(suggestionBar)
         keyboardContainer = FrameLayout(this)
         keyboardContainer.addView(buildQwertyKeyboard())
         rootView.addView(keyboardContainer)
-
         return rootView
     }
 
-    // ─────────────────────────────────────────
-    // PREDICTION BAR
-    // ─────────────────────────────────────────
+    // ── SUGGESTION BAR ────────────────────────────────────────────────────────
 
-    private fun buildPredictionBar(): LinearLayout {
+    private val suggestionViews = mutableListOf<TextView>()
+
+    private fun buildSuggestionBar(): LinearLayout {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#222222"))
@@ -90,60 +73,77 @@ class ClipKeysIME : InputMethodService() {
             )
         }
 
-        fun makePredView(): TextView = TextView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setBackgroundResource(android.R.drawable.list_selector_background)
+        for (i in 0..4) {
+            val tv = TextView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setBackgroundResource(android.R.drawable.list_selector_background)
+                setPadding(dp(4), 0, dp(4), 0)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }
+            tv.setOnClickListener { onSuggestionClick(tv.text.toString()) }
+            bar.addView(tv)
+            suggestionViews.add(tv)
+            if (i < 4) {
+                bar.addView(View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(1, LinearLayout.LayoutParams.MATCH_PARENT)
+                    setBackgroundColor(Color.parseColor("#444444"))
+                })
+            }
         }
-
-        pred1 = makePredView(); pred2 = makePredView(); pred3 = makePredView()
-
-        // Dividers
-        fun divider() = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(1, LinearLayout.LayoutParams.MATCH_PARENT)
-            setBackgroundColor(Color.parseColor("#444444"))
-        }
-
-        bar.addView(pred1); bar.addView(divider())
-        bar.addView(pred2); bar.addView(divider())
-        bar.addView(pred3)
-
-        pred1.setOnClickListener { commitPrediction(pred1.text.toString()) }
-        pred2.setOnClickListener { commitPrediction(pred2.text.toString()) }
-        pred3.setOnClickListener { commitPrediction(pred3.text.toString()) }
-
         return bar
     }
 
-    private fun updatePredictions() {
+    private fun updateSuggestions() {
         val word = currentWord.toString()
+        val (preds, corrections, nextWords) = WordPredictor.getSuggestions(word, prevWord)
+
+        // Slot 0-2: prediksi prefix (biru muda)
+        // Slot 3-4: koreksi typo (kuning) atau next word (hijau)
+        val allSuggestions = mutableListOf<Pair<String, String>>() // text, type
+
         if (word.isEmpty()) {
-            pred1.text = ""; pred2.text = ""; pred3.text = ""; return
+            // Tampilkan next word suggestions
+            nextWords.forEach { allSuggestions.add(it to "next") }
+        } else {
+            preds.forEach { allSuggestions.add(it to "pred") }
+            corrections.forEach { allSuggestions.add(it to "corr") }
         }
-        val preds = WordPredictor.predict(word)
-        pred1.text = preds.getOrNull(0) ?: ""
-        pred2.text = preds.getOrNull(1) ?: ""
-        pred3.text = preds.getOrNull(2) ?: ""
+
+        for (i in 0..4) {
+            val tv = suggestionViews[i]
+            val item = allSuggestions.getOrNull(i)
+            if (item == null) {
+                tv.text = ""; tv.setTextColor(Color.parseColor("#666666"))
+            } else {
+                tv.text = item.first
+                tv.setTextColor(when (item.second) {
+                    "pred" -> Color.WHITE
+                    "corr" -> Color.parseColor("#FFD54F") // kuning = koreksi
+                    "next" -> Color.parseColor("#81C784") // hijau = next word
+                    else -> Color.WHITE
+                })
+            }
+        }
     }
 
-    private fun commitPrediction(word: String) {
+    private fun onSuggestionClick(word: String) {
         if (word.isEmpty()) return
         val ic = currentInputConnection ?: return
-        // Hapus kata yang sedang diketik, ganti dengan prediksi
         if (currentWord.isNotEmpty()) {
             ic.deleteSurroundingText(currentWord.length, 0)
         }
         ic.commitText("$word ", 1)
         WordPredictor.learnWord(word)
+        prevWord = word
         currentWord.clear()
-        updatePredictions()
+        updateSuggestions()
     }
 
-    // ─────────────────────────────────────────
-    // KEYBOARD BUILDER
-    // ─────────────────────────────────────────
+    // ── KEYBOARD BUILDER ──────────────────────────────────────────────────────
 
     private val QWERTY_ROWS = listOf(
         listOf("q","w","e","r","t","y","u","i","o","p"),
@@ -151,7 +151,6 @@ class ClipKeysIME : InputMethodService() {
         listOf("SHIFT","z","x","c","v","b","n","m","DEL"),
         listOf("?123","📋","SPACE",".","ENTER")
     )
-
     private val NUMBER_ROWS = listOf(
         listOf("1","2","3","4","5","6","7","8","9","0"),
         listOf("@","#","$","%","&","-","+","(",")","/"),
@@ -159,15 +158,14 @@ class ClipKeysIME : InputMethodService() {
         listOf("ABC","📋","SPACE",",","ENTER")
     )
 
-    private fun buildQwertyKeyboard() = buildKeyboardRows(QWERTY_ROWS)
-    private fun buildNumberKeyboard() = buildKeyboardRows(NUMBER_ROWS)
+    private fun buildQwertyKeyboard() = buildRows(QWERTY_ROWS)
+    private fun buildNumberKeyboard() = buildRows(NUMBER_ROWS)
 
-    private fun buildKeyboardRows(rows: List<List<String>>): LinearLayout {
+    private fun buildRows(rows: List<List<String>>): LinearLayout {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(4), dp(4), dp(4), dp(4))
         }
-
         for (row in rows) {
             val rowLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -175,16 +173,10 @@ class ClipKeysIME : InputMethodService() {
                     LinearLayout.LayoutParams.MATCH_PARENT, dp(48)
                 ).apply { setMargins(0, dp(2), 0, dp(2)) }
             }
-
             for (key in row) {
-                val weight = when (key) {
-                    "SPACE" -> 4f
-                    "SHIFT", "DEL", "ENTER", "?123", "ABC" -> 1.5f
-                    "📋" -> 1.2f
-                    else -> 1f
-                }
-                val keyView = makeKey(key, weight)
-                rowLayout.addView(keyView)
+                rowLayout.addView(makeKey(key, when (key) {
+                    "SPACE" -> 4f; "SHIFT","DEL","ENTER","?123","ABC" -> 1.5f; "📋" -> 1.2f; else -> 1f
+                }))
             }
             container.addView(rowLayout)
         }
@@ -193,112 +185,65 @@ class ClipKeysIME : InputMethodService() {
 
     private fun makeKey(key: String, weight: Float): TextView {
         val isSpecial = key in listOf("SHIFT","DEL","?123","ABC","ENTER")
-        val isSpace = key == "SPACE"
-        val isClipboard = key == "📋"
-
         val bgRes = when {
-            isSpace || key == "ENTER" -> R.drawable.key_accent_bg
+            key == "SPACE" || key == "ENTER" -> R.drawable.key_accent_bg
             isSpecial -> R.drawable.key_special_bg
             else -> R.drawable.key_bg
         }
-
         val label = when (key) {
-            "SPACE" -> "space"
-            "DEL" -> "⌫"
-            "ENTER" -> "↩"
+            "SPACE" -> "space"; "DEL" -> "⌫"; "ENTER" -> "↩"
             "SHIFT" -> if (isCapsLock) "⇪" else if (isShifted) "⇧●" else "⇧"
             else -> if (isShifted || isCapsLock) key.uppercase() else key.lowercase()
         }
-
         return TextView(this).apply {
-            text = label
-            gravity = Gravity.CENTER
+            text = label; gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isSpecial || isSpace) 12f else 16f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isSpecial || key == "SPACE") 12f else 16f)
             setTypeface(typeface, if (isSpecial) Typeface.BOLD else Typeface.NORMAL)
             setBackgroundResource(bgRes)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, weight).apply {
                 setMargins(dp(2), 0, dp(2), 0)
             }
-            isClickable = true
-            isFocusable = false
-
-            setOnClickListener {
-                handleKey(key)
-                // Update shift label after press
-                if (key != "SHIFT") refreshShiftKey()
-            }
-
-            // Long press DEL = hapus kata
-            if (key == "DEL") {
-                setOnLongClickListener {
-                    deleteWord(); true
-                }
-            }
+            isClickable = true; isFocusable = false
+            setOnClickListener { handleKey(key) }
+            if (key == "DEL") setOnLongClickListener { deleteWord(); true }
         }
     }
 
-    private var shiftKeyView: TextView? = null
-
-    private fun refreshShiftKey() {
-        // Rebuild keyboard to reflect shift state
-        // Simple approach: rebuild keyboard rows
-        if (!isClipboardMode && !isNumberMode) {
-            keyboardContainer.removeAllViews()
-            keyboardContainer.addView(buildQwertyKeyboard())
-        }
-    }
-
-    // ─────────────────────────────────────────
-    // KEY HANDLER
-    // ─────────────────────────────────────────
+    // ── KEY HANDLER ───────────────────────────────────────────────────────────
 
     private fun handleKey(key: String) {
         val ic = currentInputConnection ?: return
-
         when (key) {
             "DEL" -> {
                 ic.deleteSurroundingText(1, 0)
-                if (currentWord.isNotEmpty()) {
-                    currentWord.deleteCharAt(currentWord.length - 1)
-                    updatePredictions()
-                }
+                if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
+                updateSuggestions()
             }
             "SHIFT" -> {
-                when {
-                    isCapsLock -> { isCapsLock = false; isShifted = false }
-                    isShifted -> isCapsLock = true
-                    else -> isShifted = true
-                }
-                refreshShiftKey()
+                when { isCapsLock -> { isCapsLock = false; isShifted = false }; isShifted -> isCapsLock = true; else -> isShifted = true }
+                rebuildKeyboard()
             }
             "SPACE" -> {
-                if (currentWord.isNotEmpty()) WordPredictor.learnWord(currentWord.toString())
+                if (currentWord.isNotEmpty()) {
+                    WordPredictor.learnWord(currentWord.toString())
+                    prevWord = currentWord.toString()
+                }
                 currentWord.clear()
                 ic.commitText(" ", 1)
-                updatePredictions()
+                updateSuggestions()
             }
             "ENTER" -> {
-                if (currentWord.isNotEmpty()) WordPredictor.learnWord(currentWord.toString())
+                if (currentWord.isNotEmpty()) { WordPredictor.learnWord(currentWord.toString()); prevWord = currentWord.toString() }
                 currentWord.clear()
                 val action = currentInputEditorInfo?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
-                if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED)
                     ic.performEditorAction(action)
-                } else {
-                    ic.commitText("\n", 1)
-                }
-                updatePredictions()
+                else ic.commitText("\n", 1)
+                updateSuggestions()
             }
-            "?123" -> {
-                isNumberMode = true
-                keyboardContainer.removeAllViews()
-                keyboardContainer.addView(buildNumberKeyboard())
-            }
-            "ABC" -> {
-                isNumberMode = false
-                keyboardContainer.removeAllViews()
-                keyboardContainer.addView(buildQwertyKeyboard())
-            }
+            "?123" -> { isNumberMode = true; rebuildKeyboard() }
+            "ABC" -> { isNumberMode = false; rebuildKeyboard() }
             "📋" -> {
                 isClipboardMode = true
                 keyboardContainer.removeAllViews()
@@ -307,134 +252,89 @@ class ClipKeysIME : InputMethodService() {
             else -> {
                 val char = if (isShifted || isCapsLock) key.uppercase() else key.lowercase()
                 ic.commitText(char, 1)
-                // Track current word
-                if (char.all { it.isLetter() || it == '\'' }) {
-                    currentWord.append(char)
-                } else {
-                    if (currentWord.isNotEmpty()) WordPredictor.learnWord(currentWord.toString())
+                if (char.all { it.isLetter() || it == '\'' }) currentWord.append(char)
+                else {
+                    if (currentWord.isNotEmpty()) { WordPredictor.learnWord(currentWord.toString()); prevWord = currentWord.toString() }
                     currentWord.clear()
                 }
-                // Auto-unshift after one char (not caps lock)
-                if (isShifted && !isCapsLock) {
-                    isShifted = false
-                    refreshShiftKey()
-                }
-                updatePredictions()
+                if (isShifted && !isCapsLock) { isShifted = false; rebuildKeyboard() }
+                updateSuggestions()
             }
         }
     }
 
-    private fun deleteWord() {
-        val ic = currentInputConnection ?: return
-        val before = ic.getTextBeforeCursor(50, 0)?.toString() ?: return
-        // Hapus sampai spasi terakhir
-        var count = 0
-        val trimmed = before.trimEnd()
-        val lastSpace = trimmed.lastIndexOf(' ')
-        count = if (lastSpace < 0) trimmed.length else trimmed.length - lastSpace
-        if (count > 0) ic.deleteSurroundingText(count, 0)
-        currentWord.clear()
-        updatePredictions()
+    private fun rebuildKeyboard() {
+        if (isClipboardMode) return
+        keyboardContainer.removeAllViews()
+        keyboardContainer.addView(if (isNumberMode) buildNumberKeyboard() else buildQwertyKeyboard())
     }
 
-    // ─────────────────────────────────────────
-    // CLIPBOARD PANEL
-    // ─────────────────────────────────────────
+    private fun deleteWord() {
+        val ic = currentInputConnection ?: return
+        val before = ic.getTextBeforeCursor(100, 0)?.toString() ?: return
+        val trimmed = before.trimEnd()
+        val lastSpace = trimmed.lastIndexOf(' ')
+        val count = if (lastSpace < 0) trimmed.length else trimmed.length - lastSpace
+        if (count > 0) ic.deleteSurroundingText(count, 0)
+        currentWord.clear(); updateSuggestions()
+    }
+
+    // ── CLIPBOARD PANEL ───────────────────────────────────────────────────────
 
     private fun buildClipboardPanel(): LinearLayout {
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#1A1A1A"))
         }
-
-        // Top bar: search + close
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#222222"))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)
-            )
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44))
             setPadding(dp(8), dp(4), dp(8), dp(4))
         }
-
         clipSearchEdit = EditText(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
-            hint = "🔍 Cari clipboard..."
-            setHintTextColor(Color.GRAY)
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#333333"))
-            setPadding(dp(8), 0, dp(8), 0)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            isSingleLine = true
-            // Jangan trigger IME saat ini aktif
-            showSoftInputOnFocus = false
+            hint = "🔍 Cari clipboard..."; setHintTextColor(Color.GRAY)
+            setTextColor(Color.WHITE); setBackgroundColor(Color.parseColor("#333333"))
+            setPadding(dp(8), 0, dp(8), 0); setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            isSingleLine = true; showSoftInputOnFocus = false
         }
-
         val btnClose = TextView(this).apply {
-            text = "⌨"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            text = "⌨"; setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(dp(44), LinearLayout.LayoutParams.MATCH_PARENT)
-            setOnClickListener {
-                isClipboardMode = false
-                keyboardContainer.removeAllViews()
-                keyboardContainer.addView(if (isNumberMode) buildNumberKeyboard() else buildQwertyKeyboard())
-            }
+            setOnClickListener { isClipboardMode = false; rebuildKeyboard() }
         }
+        topBar.addView(clipSearchEdit); topBar.addView(btnClose); panel.addView(topBar)
 
-        topBar.addView(clipSearchEdit)
-        topBar.addView(btnClose)
-        panel.addView(topBar)
-
-        // Clipboard list
         clipList = ListView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(160)
-            )
-            divider = null
-            dividerHeight = 0
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(160))
+            divider = null; dividerHeight = 0
         }
-
         refreshClipList("")
         panel.addView(clipList)
 
-        // Search watcher
         clipSearchEdit.addTextChangedListener(object : TextWatcher {
             override fun afterTextChanged(s: Editable?) { refreshClipList(s?.toString() ?: "") }
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
         })
-
         return panel
     }
 
     private fun refreshClipList(query: String) {
         val items = ClipboardStore.search(query)
-        clipAdapter = ClipboardListAdapter(this, items) { item, action ->
+        clipList.adapter = ClipboardListAdapter(this, items) { item, action ->
             when (action) {
                 "paste" -> {
-                    val ic = currentInputConnection ?: return@ClipboardListAdapter
-                    ic.beginBatchEdit()
-                    ic.commitText(item.text, 1) // Full text, unlimited!
-                    ic.endBatchEdit()
-                    // Tutup panel setelah paste
-                    isClipboardMode = false
-                    keyboardContainer.removeAllViews()
-                    keyboardContainer.addView(if (isNumberMode) buildNumberKeyboard() else buildQwertyKeyboard())
+                    currentInputConnection?.commitText(item.text, 1)
+                    isClipboardMode = false; rebuildKeyboard()
                 }
-                "pin" -> {
-                    ClipboardStore.togglePin(this, item.id)
-                    refreshClipList(clipSearchEdit.text.toString())
-                }
-                "delete" -> {
-                    ClipboardStore.delete(this, item.id)
-                    refreshClipList(clipSearchEdit.text.toString())
-                }
+                "pin" -> { ClipboardStore.togglePin(this, item.id); refreshClipList(clipSearchEdit.text.toString()) }
+                "delete" -> { ClipboardStore.delete(this, item.id); refreshClipList(clipSearchEdit.text.toString()) }
             }
         }
-        clipList.adapter = clipAdapter
     }
 
-    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 }
